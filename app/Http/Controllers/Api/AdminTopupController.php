@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\WalletTopupRequest;
+use App\Services\NotificationService;
 use App\Services\WalletService;
 use App\Support\Audit;
 use Illuminate\Http\Request;
@@ -67,6 +68,8 @@ class AdminTopupController extends Controller
             return $topup;
         });
 
+        app(NotificationService::class)->topupApproved($topup);
+
         Audit::log($request, 'topup.approved', 'wallet_topup_request', $topup->id, [
             'retailer_id' => $topup->retailer_id,
             'amount'      => (float) $topup->amount,
@@ -92,6 +95,8 @@ class AdminTopupController extends Controller
 
             return $topup;
         });
+
+        app(NotificationService::class)->topupRejected($topup);
 
         Audit::log($request, 'topup.rejected', 'wallet_topup_request', $topup->id, [
             'retailer_id' => $topup->retailer_id,

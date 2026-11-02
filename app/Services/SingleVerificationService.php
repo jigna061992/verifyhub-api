@@ -99,6 +99,8 @@ class SingleVerificationService
             'otp_sent_at'  => now(),
         ]);
 
+        $this->rememberDevOtp($v, $result);
+
         return $this->fresh($v);
     }
 
@@ -148,6 +150,8 @@ class SingleVerificationService
             'otp_sent_at'  => now(),
         ]);
 
+        $this->rememberDevOtp($v, $result);
+
         return $this->fresh($v);
     }
 
@@ -171,9 +175,15 @@ class SingleVerificationService
         }
 
         if ($result->success) {
+            $name  = (string) ($result->data['name'] ?? '');
+            $given = (string) (($v->meta ?? [])['customer_name'] ?? '');
+            $score = ($name !== '' && $given !== '') ? NameMatcher::score($given, $name) : null;
+
             $this->settle($v, true, [
-                'name'          => (string) ($result->data['name'] ?? ''),
-                'aadhaar_last4' => substr((string) $v->input_masked, -4),
+                'name'             => $name,
+                'aadhaar_last4'    => substr((string) $v->input_masked, -4),
+                'name_match_score' => $score,
+                'name_match'       => $score === null ? null : ($score >= (int) config('kyc.name_match.aadhaar', 80) ? 'match' : 'mismatch'),
             ], null, $result->providerRef);
 
             return $this->fresh($v);
@@ -351,7 +361,12 @@ class SingleVerificationService
         $result = $v->status === 'success' ? ($v->result ?? []) : null;
 
         if ($result && $v->service?->code === 'AADHAAR') {
-            $result = ['name' => $result['name'] ?? null, 'aadhaar' => 'XXXXXXXX' . ($result['aadhaar_last4'] ?? '')];
+            $result = [
+                'name'             => $result['name'] ?? null,
+                'aadhaar'          => 'XXXXXXXX' . ($result['aadhaar_last4'] ?? ''),
+                'name_match_score' => $result['name_match_score'] ?? null,
+                'name_match'       => $result['name_match'] ?? null,
+            ];
         }
 
         return [
@@ -371,6 +386,8 @@ class SingleVerificationService
                 'tries_left'     => max((int) config('verification.sessions.max_attempts') - $v->attempts, 0),
                 'cooldown_left'  => $this->cooldownLeft($v),
             ] : null,
+            // Test mode only: the mock provider's OTP, so the page can show it (it plays the role of the SMS)
+            'dev_otp'          => ($open && $v->service?->code === 'AADHAAR' && $this->isDevMode()) ? ($meta['dev_otp'] ?? null) : null,
             'sign_url'         => $open && $v->stage === 'signing' ? ($meta['sign_url'] ?? null) : null,
             'expires_at'       => $open ? $v->expires_at?->toIso8601String() : null,
             'wallet_available' => (float) (Wallet::where('retailer_id', $v->retailer_id)->value('available_balance') ?? 0),
@@ -383,6 +400,18 @@ class SingleVerificationService
     /* ------------------------------------------------------------------
      | Internals
      * ------------------------------------------------------------------ */
+
+    // Test mode only: keep the OTP the mock provider made (encrypted with the rest of meta). It is shown only while the check is open.
+    private function rememberDevOtp(Verification $v, $result): void
+    {
+        if (! $this->isDevMode() || empty($result->data['dev_otp'])) {
+            return;
+        }
+
+        $row       = Verification::find($v->id);
+        $row->meta = array_merge($row->meta ?? [], ['dev_otp' => (string) $result->data['dev_otp']]);
+        $row->save();
+    }
 
     private function service(string $code): VerificationService
     {

@@ -38,4 +38,16 @@ return [
         . "for the purpose of {purpose}.\n\n"
         . "I understand that VerifyHub keeps only masked identifiers and the outcome of the checks, and that I can withdraw this consent by contacting {retailer}.\n"
         . "Consent version: {version}",
-];
+
+            // Wallet: the retailer gets a "low balance" alert when the AVAILABLE balance falls below this amount (Rs).
+    // Sent once, when the balance crosses this line. It comes again only after the balance
+    // has gone back above the line and then falls below it again.
+    'low_balance_threshold' => (float) env('LOW_BALANCE_THRESHOLD', 500),
+     // Timeout handling for PAN / Bank / GST. true = keep the money on hold and queue the check for an admin
+    // (Admin > Reconciliation). false = release the money at once and tell the retailer to try again.
+    'reconciliation_enabled' => (bool) env('RECONCILIATION_ENABLED', true),
+
+    // An open reconciliation older than this many hours is shown as "Overdue" to the admin
+    'reconciliation_overdue_hours' => (int) env('RECONCILIATION_OVERDUE_HOURS', 24),
+
+    ];

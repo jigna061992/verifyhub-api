@@ -26,6 +26,12 @@ class WalletService
         return Uuid::uuid5(Uuid::NAMESPACE_URL, "verifyhub:topup:{$topupId}")->toString();
     }
 
+    // One reference per Razorpay order. The order can be settled by the checkout call and by the webhook, the wallet changes only once.
+    public static function razorpayReference(string $orderId): string
+    {
+        return Uuid::uuid5(Uuid::NAMESPACE_URL, "verifyhub:razorpay:{$orderId}")->toString();
+    }
+
     // $step = reserve | debit | release
     public static function verificationReference(int $verificationId, string $step): string
     {
@@ -84,6 +90,7 @@ class WalletService
 
             $available = round((float) $wallet->available_balance, 2);
             $reserved  = round((float) $wallet->reserved_balance, 2);
+            $before    = $available; // balance before this change (used for the low balance alert)
 
             switch ($type) {
                 case 'credit':
@@ -126,7 +133,7 @@ class WalletService
                 'version'           => $wallet->version + 1,
             ]);
 
-            return WalletLedger::create([
+            $entry = WalletLedger::create([
                 'wallet_id'     => $wallet->id,
                 'reference'     => $reference,
                 'type'          => $type,
@@ -134,6 +141,26 @@ class WalletService
                 'balance_after' => $available,
                 'description'   => $description,
             ]);
+
+            // Only money going OUT can make the balance low
+            if (in_array($type, ['reserve', 'reversal'], true)) {
+                $this->checkLowBalance($retailerId, $before, $available);
+            }
+
+            return $entry;
         });
+    }
+
+    // Alert once, at the moment the available balance goes from "enough" to "below the line".
+    // It runs inside the same transaction: if the wallet change is rolled back, the alert is rolled back too.
+    private function checkLowBalance(int $retailerId, float $before, float $after): void
+    {
+        $threshold = (float) config('verification.low_balance_threshold', 500);
+
+        if ($threshold <= 0 || $before < $threshold || $after >= $threshold) {
+            return;
+        }
+
+        app(NotificationService::class)->lowBalance($retailerId, $after, $threshold);
     }
 }

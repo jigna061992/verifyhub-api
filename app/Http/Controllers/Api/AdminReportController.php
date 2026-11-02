@@ -4,15 +4,21 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\KycCase;
+use App\Models\Reconciliation;
 use App\Models\Retailer;
+use App\Models\RetailerPricing;
 use App\Models\Verification;
 use App\Models\VerificationService;
+use App\Support\Csv;
 use Carbon\Carbon;
+use Generator;
 use Illuminate\Http\Request;
 
-// Super admin: revenue, cost and profit for a date range.
+// Super admin: revenue, cost, profit (margin) for a date range.
 // Revenue is counted only for successful single checks and completed Complete KYC cases
 // (failed / cancelled / expired cases return the money to the retailer, so they earn nothing).
+// Margin of one check = the price charged to the retailer - the provider cost. Both are copied into the
+// verification at the time of the check, so a later price change never rewrites old numbers.
 class AdminReportController extends Controller
 {
     private const MAX_DAYS = 366;
@@ -58,7 +64,131 @@ class AdminReportController extends Controller
         }, $filename, ['Content-Type' => 'text/csv; charset=UTF-8']);
     }
 
+    // CSV with one row per check / KYC case: price, provider cost and margin of every transaction
+    public function transactions(Request $request)
+    {
+        [$from, $to, $error] = $this->range($request);
+
+        if ($error) {
+            return response()->json(['message' => $error], 422);
+        }
+
+        $filename = 'verifyhub-transactions-' . $from->toDateString() . '-to-' . $to->toDateString() . '.csv';
+
+        return Csv::download(
+            $filename,
+            ['Date', 'Request', 'Type', 'Retailer', 'Service', 'Status', 'Charged (INR)', 'Provider cost (INR)', 'Margin (INR)'],
+            $this->transactionRows($from, $to)
+        );
+    }
+
     /* ------------------------------------------------------------------ */
+
+    // One row at a time (lazyById reads 500 rows per query), so a big range never fills the memory.
+    // Only charged rows carry money: a failed or cancelled check shows 0.00 (the wallet was released).
+    private function transactionRows(Carbon $from, Carbon $to): Generator
+    {
+        $revenue = 0.0;
+        $cost    = 0.0;
+
+        $checks = Verification::with(['retailer:id,business_name', 'service:id,name'])
+            ->whereBetween('created_at', [$from, $to])
+            ->lazyById(500);
+
+        foreach ($checks as $v) {
+            $charged = $v->status === 'success';
+            $price   = $charged ? (float) $v->price : 0.0;
+            $pCost   = $charged ? (float) $v->provider_cost : 0.0;
+            $revenue += $price;
+            $cost    += $pCost;
+
+            yield [
+                $v->created_at?->format('Y-m-d H:i'),
+                'VRF-' . str_pad((string) $v->id, 6, '0', STR_PAD_LEFT),
+                'Single check',
+                $v->retailer?->business_name ?? 'Deleted retailer',
+                $v->service?->name ?? 'Unknown',
+                $v->status,
+                $this->money($price),
+                $this->money($pCost),
+                $this->money($price - $pCost),
+            ];
+        }
+
+        $cases = KycCase::with(['retailer:id,business_name', 'service:id,name'])
+            ->whereBetween('created_at', [$from, $to])
+            ->lazyById(500);
+
+        foreach ($cases as $c) {
+            $charged = $c->status === 'completed';
+            $price   = $charged ? (float) $c->price : 0.0;
+            $pCost   = $charged ? (float) $c->provider_cost : 0.0;
+            $revenue += $price;
+            $cost    += $pCost;
+
+            yield [
+                $c->created_at?->format('Y-m-d H:i'),
+                'KYC-' . str_pad((string) $c->id, 6, '0', STR_PAD_LEFT),
+                'Complete KYC',
+                $c->retailer?->business_name ?? 'Deleted retailer',
+                $c->service?->name ?? 'Unknown',
+                $c->status,
+                $this->money($price),
+                $this->money($pCost),
+                $this->money($price - $pCost),
+            ];
+        }
+
+        yield ['', '', 'TOTAL', '', '', '', $this->money($revenue), $this->money($cost), $this->money($revenue - $cost)];
+    }
+
+    private function money(float $value): string
+    {
+        return number_format($value, 2, '.', '');
+    }
+
+    // Margin in % of revenue (null when there is no revenue, so the screen can show a dash)
+    private function marginPercent(float $revenue, float $cost): ?float
+    {
+        return $revenue > 0 ? round(($revenue - $cost) / $revenue * 100, 1) : null;
+    }
+
+    // Prices that are lower than the provider cost: every successful check at that price loses money
+    private function belowCostAlerts(): array
+    {
+        $alerts = [];
+
+        foreach (VerificationService::where('enabled', true)->get() as $s) {
+            if ((float) $s->default_price < (float) $s->provider_cost) {
+                $alerts[] = [
+                    'scope'   => 'Default price',
+                    'service' => $s->name,
+                    'price'   => (float) $s->default_price,
+                    'cost'    => (float) $s->provider_cost,
+                ];
+            }
+        }
+
+        $custom = RetailerPricing::query()
+            ->join('verification_services as s', 's.id', '=', 'retailer_pricings.service_id')
+            ->join('retailers as r', 'r.id', '=', 'retailer_pricings.retailer_id')
+            ->where('s.enabled', true)
+            ->whereColumn('retailer_pricings.custom_price', '<', 's.provider_cost')
+            ->select('r.business_name', 's.name as service', 'retailer_pricings.custom_price as price', 's.provider_cost as cost')
+            ->limit(50)
+            ->get();
+
+        foreach ($custom as $row) {
+            $alerts[] = [
+                'scope'   => $row->business_name,
+                'service' => $row->service,
+                'price'   => (float) $row->price,
+                'cost'    => (float) $row->cost,
+            ];
+        }
+
+        return $alerts;
+    }
 
     private function range(Request $request): array
     {
@@ -131,7 +261,8 @@ class AdminReportController extends Controller
             $s['profit']       = round($s['revenue'] - $s['cost'], 2);
             $s['revenue']      = round($s['revenue'], 2);
             $s['cost']         = round($s['cost'], 2);
-            $s['success_rate'] = $s['total'] > 0 ? round($s['success'] / $s['total'] * 100, 1) : null;
+            $s['success_rate']   = $s['total'] > 0 ? round($s['success'] / $s['total'] * 100, 1) : null;
+            $s['margin_percent'] = $this->marginPercent($s['revenue'], $s['cost']);
 
             return $s;
         })->sortByDesc('revenue')->values();
@@ -157,6 +288,7 @@ class AdminReportController extends Controller
                 'revenue'        => round($revenue, 2),
                 'cost'           => round($cost, 2),
                 'profit'         => round($revenue - $cost, 2),
+                'margin_percent' => $this->marginPercent($revenue, $cost),
             ];
         })->sortByDesc('revenue')->values();
 
@@ -168,8 +300,30 @@ class AdminReportController extends Controller
             $revenue = (float) ($vDaily[$key]->revenue ?? 0) + (float) ($kDaily[$key]->revenue ?? 0);
             $cost    = (float) ($vDaily[$key]->cost ?? 0) + (float) ($kDaily[$key]->cost ?? 0);
 
-            $daily[] = ['date' => $key, 'revenue' => round($revenue, 2), 'profit' => round($revenue - $cost, 2)];
+            $daily[] = ['date' => $key, 'revenue' => round($revenue, 2), 'cost' => round($cost, 2), 'profit' => round($revenue - $cost, 2)];
         }
+
+        // ---- Monthly series (the daily numbers added up per month) ----
+        $months = [];
+        foreach ($daily as $d) {
+            $m = substr($d['date'], 0, 7);
+            $months[$m] ??= ['month' => $m, 'revenue' => 0.0, 'cost' => 0.0];
+            $months[$m]['revenue'] += $d['revenue'];
+            $months[$m]['cost']    += $d['cost'];
+        }
+
+        $monthly = collect($months)->map(fn ($m) => [
+            'month'          => $m['month'],
+            'revenue'        => round($m['revenue'], 2),
+            'cost'           => round($m['cost'], 2),
+            'profit'         => round($m['revenue'] - $m['cost'], 2),
+            'margin_percent' => $this->marginPercent($m['revenue'], $m['cost']),
+        ])->values();
+
+        // ---- Failed / still running counts, and money on hold right now (open reconciliations) ----
+        $vStatus = Verification::whereBetween('created_at', [$from, $to])->selectRaw('status, COUNT(*) AS c')->groupBy('status')->pluck('c', 'status');
+        $kStatus = KycCase::whereBetween('created_at', [$from, $to])->selectRaw('status, COUNT(*) AS c')->groupBy('status')->pluck('c', 'status');
+        $hold    = Reconciliation::where('status', 'open')->selectRaw('COUNT(*) AS c, COALESCE(SUM(amount), 0) AS a')->first();
 
         // ---- Totals ----
         $revenue = round($byService->sum('revenue'), 2);
@@ -186,10 +340,18 @@ class AdminReportController extends Controller
                 'checks_success' => (int) $vRetailer->sum('ok_count'),
                 'kyc'            => (int) $kRetailer->sum('total'),
                 'kyc_completed'  => (int) $kRetailer->sum('ok_count'),
+                'margin_percent' => $this->marginPercent($revenue, $cost),
+                'failed'         => (int) ($vStatus['failed'] ?? 0)
+                                    + (int) ($kStatus['failed'] ?? 0) + (int) ($kStatus['cancelled'] ?? 0) + (int) ($kStatus['expired'] ?? 0),
+                'in_progress'    => (int) ($vStatus['pending'] ?? 0) + (int) ($kStatus['in_progress'] ?? 0),
             ],
+            // Money held in retailer wallets because the provider did not answer (right now, not limited to the dates above)
+            'on_hold'     => ['count' => (int) ($hold->c ?? 0), 'amount' => round((float) ($hold->a ?? 0), 2)],
+            'alerts'      => ['below_cost' => $this->belowCostAlerts()],
             'by_service'  => $byService,
             'by_retailer' => $byRetailer,
             'daily'       => $daily,
+            'monthly'     => $monthly,
         ];
     }
 

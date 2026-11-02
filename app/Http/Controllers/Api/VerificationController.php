@@ -6,8 +6,11 @@ use App\Exceptions\InsufficientBalanceException;
 use App\Http\Controllers\Controller;
 use App\Models\Verification;
 use App\Models\VerificationService;
+use App\Models\Wallet;
+use App\Services\SingleVerificationService;
 use App\Services\VerificationRunner;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 // Retailer side: run a verification and see own history
 class VerificationController extends Controller
@@ -25,8 +28,53 @@ class VerificationController extends Controller
     // Every single check a retailer can see in lists and filters
     public const ALL = ['PAN', 'BANK', 'AADHAAR', 'GST', 'ESIGN'];
 
+    // Consent shown for PAN / Bank / GST (Aadhaar and e-Sign use config('verification.consent.*'))
+    private const DEFAULT_CONSENT = [
+        'version' => 'v1',
+        'text'    => 'I confirm that the customer has given explicit consent for this verification, and it is being performed for a lawful KYC purpose ({purpose}) in line with the acceptable use policy of {retailer}.',
+    ];
+
     public function __construct(private VerificationRunner $runner)
     {
+    }
+
+    // One service for its own page: price, wallet, today's count, consent text, purposes and (test mode only) sample values
+    public function show(Request $request, string $code)
+    {
+        $retailer = $this->retailer($request);
+        $code     = strtoupper(trim($code));
+
+        abort_unless(in_array($code, self::ALL, true), 404, 'Unknown service.');
+
+        $service = VerificationService::where('code', $code)->where('enabled', true)->first();
+
+        abort_if(! $service, 404, 'This service is not available right now.');
+
+        $session = in_array($code, self::SESSION, true);
+        $dev     = $this->isDevMode($code);
+
+        return response()->json([
+            'code'             => $service->code,
+            'name'             => $service->name,
+            'flow'             => match ($code) {
+                'AADHAAR' => 'otp',
+                'ESIGN'   => 'esign',
+                default   => 'instant',
+            },
+            'price'            => $this->runner->priceFor($retailer, $service),
+            'wallet_available' => (float) (Wallet::where('retailer_id', $retailer->id)->value('available_balance') ?? 0),
+            'today_count'      => Verification::where('retailer_id', $retailer->id)
+                ->where('service_id', $service->id)
+                ->where('created_at', '>=', now()->startOfDay())
+                ->count(),
+            'retailer'         => $retailer->business_name,
+            'purposes'         => collect(config('kyc.purposes'))->map(fn ($label, $key) => ['value' => $key, 'label' => $label])->values(),
+            'consent'          => $this->consentFor($code),
+            'ttl_minutes'      => $session ? (int) config('verification.sessions.' . strtolower($code) . '_ttl_minutes') : null,
+            'name_match'       => in_array($code, ['PAN', 'BANK', 'GST', 'AADHAAR'], true),
+            'dev_mode'         => $dev,
+            'samples'          => $dev ? $this->samplesFor($code) : [],
+        ]);
     }
 
     // Enabled services with the price THIS retailer will pay
@@ -94,8 +142,36 @@ class VerificationController extends Controller
         [$rules, $messages] = $this->rulesFor($code);
         $input = $request->validate($rules, $messages);
 
+        // Customer name (optional, used for the name match), purpose and the consent tick
+        $extra = $request->validate([
+            'customer_name' => ['nullable', 'string', 'min:2', 'max:100', "regex:/^[\\pL][\\pL .'-]*$/u"],
+            'purpose'       => ['nullable', Rule::in(array_keys(config('kyc.purposes')))],
+            'consent'       => ['accepted'],
+        ], [
+            'customer_name.regex' => 'Use letters and spaces only.',
+            'consent.accepted'    => 'Customer consent must be confirmed before verifying.',
+        ]);
+
+        $purpose = $extra['purpose'] ?? array_key_first(config('kyc.purposes'));
+        $consent = $this->consentFor($code);
+        $text    = strtr((string) $consent['text'], [
+            '{retailer}' => $retailer->business_name,
+            '{purpose}'  => config('kyc.purposes')[$purpose] ?? '',
+        ]);
+        $name = trim((string) ($extra['customer_name'] ?? ''));
+
         try {
-            $verification = $this->runner->run($retailer, $service, $input);
+            $verification = $this->runner->run($retailer, $service, $input, [
+                'customer_name' => $name !== '' ? $name : null,
+                'consent'       => [
+                    'text'       => $text,
+                    'version'    => $consent['version'],
+                    'purpose'    => $purpose,
+                    'user_id'    => $request->user()->id,
+                    'ip'         => $request->ip(),
+                    'user_agent' => \Illuminate\Support\Str::limit((string) $request->userAgent(), 250, ''),
+                ],
+            ]);
         } catch (InsufficientBalanceException) {
             $price = $this->runner->priceFor($retailer, $service);
 
@@ -113,6 +189,55 @@ class VerificationController extends Controller
             ],
             201
         );
+    }
+
+    // Consent text and version of a service
+    private function consentFor(string $code): array
+    {
+        $configured = config('verification.consent.' . strtolower($code));
+
+        return [
+            'text'    => (string) ($configured['text'] ?? self::DEFAULT_CONSENT['text']),
+            'version' => (string) ($configured['version'] ?? self::DEFAULT_CONSENT['version']),
+        ];
+    }
+
+    // True only with a mock provider outside production: the page then shows "Try sample" buttons
+    private function isDevMode(string $code): bool
+    {
+        if (app()->isProduction()) {
+            return false;
+        }
+
+        return in_array($code, SingleVerificationService::CODES, true)
+            ? config('kyc.driver') === 'mock'
+            : config('verification.driver') === 'mock';
+    }
+
+    // Values that give each result with the MOCK provider (see MockProvider / MockKycProvider)
+    private function samplesFor(string $code): array
+    {
+        return match ($code) {
+            'PAN' => [
+                ['label' => 'Valid PAN',         'values' => ['pan' => 'ABCPK1234L']],
+                ['label' => 'Record not found',  'values' => ['pan' => 'ABCPK1234Z']],
+                ['label' => 'Provider timeout',  'values' => ['pan' => 'ABCPK1234E']],
+            ],
+            'BANK' => [
+                ['label' => 'Valid account',     'values' => ['account_number' => '123456789012', 'ifsc' => 'SBIN0001234']],
+                ['label' => 'Account not found', 'values' => ['account_number' => '123456789010', 'ifsc' => 'SBIN0001234']],
+                ['label' => 'Provider timeout',  'values' => ['account_number' => '123456789019', 'ifsc' => 'SBIN0001234']],
+            ],
+            'GST' => [
+                ['label' => 'Valid GSTIN',       'values' => ['gstin' => '24ABCPK1234L1Z5']],
+                ['label' => 'GSTIN not found',   'values' => ['gstin' => '24ABCPK1234L1Z0']],
+            ],
+            'AADHAAR' => [
+                ['label' => 'Valid Aadhaar',     'values' => ['aadhaar' => '234567890121']],
+                ['label' => 'Not found',         'values' => ['aadhaar' => '234567890120']],
+            ],
+            default => [],
+        };
     }
 
     private function rulesFor(string $code): array
@@ -163,6 +288,7 @@ class VerificationController extends Controller
             'input_masked'   => $v->input_masked,
             'price'          => (float) $v->price,
             'charged'        => $v->status === 'success' ? (float) $v->price : 0.0,
+            'customer_name'  => $v->meta['customer_name'] ?? null,
             'failure_reason' => $v->failure_reason,
             'stage'          => $v->status === 'pending' ? $v->stage : null,
             'result'         => $withResult && $v->status === 'success' ? $v->result : null,

@@ -92,6 +92,7 @@ class WalletController extends Controller
             'method'      => $data['method'],
             'utr'         => $data['utr'],
         ]);
+        $topup->refresh(); // load the database defaults (status = pending), otherwise "status" is null in the response
 
         return response()->json([
             'id'         => $topup->id,

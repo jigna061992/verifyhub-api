@@ -5,6 +5,7 @@ use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\AccountController;
 use App\Http\Controllers\Api\AdminBadgeController;
 use App\Http\Controllers\Api\AdminAuditController;
+use App\Http\Controllers\Api\AdminReconciliationController;
 use App\Http\Controllers\Api\AdminController;
 use App\Http\Controllers\Api\AdminKycCaseController;
 use App\Http\Controllers\Api\AdminKycServiceController;
@@ -15,6 +16,10 @@ use App\Http\Controllers\Api\AdminWalletController;
 use App\Http\Controllers\Api\HistoryController;
 use App\Http\Controllers\Api\KycController;
 use App\Http\Controllers\Api\KycWebhookController;
+use App\Http\Controllers\Api\NotificationController;
+use App\Http\Controllers\Api\PasswordResetController;
+use App\Http\Controllers\Api\RazorpayController;
+use App\Http\Controllers\Api\RazorpayWebhookController;
 use App\Http\Controllers\Api\RetailerController;
 use App\Http\Controllers\Api\ReportPdfController;
 use App\Http\Controllers\Api\RetailerExportController;
@@ -24,15 +29,29 @@ use App\Http\Controllers\Api\WalletController;
 use App\Http\Middleware\EnsureRole;
 
 // Public routes (no throttle)
-Route::post('/login', [AuthController::class, 'login']);
+Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:login');
+// Route::post('/login', [AuthController::class, 'login']);
+
+// Forgot / reset password (public). Throttled per IP.
+Route::post('/forgot-password', [PasswordResetController::class, 'forgot'])->middleware('throttle:5,1');
+Route::post('/reset-password', [PasswordResetController::class, 'reset'])->middleware('throttle:10,1');
 
 // Provider callback. No login: it is trusted only if the HMAC signature in the header is correct.
 Route::post('/webhooks/esign', [KycWebhookController::class, 'esign'])->middleware('throttle:60,1');
+
+// Razorpay callback. No login: trusted only if the X-Razorpay-Signature header is correct.
+Route::post('/webhooks/razorpay', [RazorpayWebhookController::class, 'handle'])->middleware('throttle:120,1');
 
 // Any logged-in user (admin or retailer)
 Route::middleware(['auth:sanctum'])->group(function () {
     Route::get('/user', [AuthController::class, 'getUser']);
     Route::post('/logout', [AuthController::class, 'logout']);
+
+    // Notifications (each user sees only their own)
+    Route::get('/notifications', [NotificationController::class, 'index']);
+    Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
+    Route::post('/notifications/read-all', [NotificationController::class, 'readAll']);
+    Route::post('/notifications/{id}/read', [NotificationController::class, 'read'])->whereNumber('id');
 
     // My account (profile details + change password)
     Route::get('/account', [AccountController::class, 'show']);
@@ -82,6 +101,8 @@ Route::middleware(['auth:sanctum', EnsureRole::class . ':super_admin'])->group(f
 
     // Verifications (all retailers)
     Route::get('/admin/verifications', [AdminVerificationController::class, 'index']);
+    Route::get('/admin/reconciliations', [AdminReconciliationController::class, 'index']);
+    Route::post('/admin/reconciliations/{id}/resolve', [AdminReconciliationController::class, 'resolve'])->whereNumber('id')->middleware('throttle:30,1');
 
     // Complete KYC cases (all retailers)
     Route::get('/admin/kyc-cases', [AdminKycCaseController::class, 'index']);
@@ -92,6 +113,7 @@ Route::middleware(['auth:sanctum', EnsureRole::class . ':super_admin'])->group(f
     // Reports
     Route::get('/admin/reports', [AdminReportController::class, 'summary']);
     Route::get('/admin/reports/export', [AdminReportController::class, 'export'])->middleware('throttle:10,1');
+    Route::get('/admin/reports/transactions', [AdminReportController::class, 'transactions'])->middleware('throttle:10,1');
 });
 
 // Retailer only
@@ -104,12 +126,19 @@ Route::middleware(['auth:sanctum', EnsureRole::class . ':retailer'])->group(func
     Route::get('/retailer/topups', [WalletController::class, 'topups']);
     Route::post('/retailer/topups', [WalletController::class, 'storeTopup']);
 
+    // Online top-up with Razorpay (TEST keys while developing: fake money only)
+    Route::get('/retailer/payments/razorpay/config', [RazorpayController::class, 'config']);
+    Route::post('/retailer/payments/razorpay/order', [RazorpayController::class, 'createOrder'])->middleware('throttle:10,1');
+    Route::post('/retailer/payments/razorpay/verify', [RazorpayController::class, 'verify'])->middleware('throttle:20,1');
+    Route::post('/retailer/payments/razorpay/failed', [RazorpayController::class, 'failed'])->middleware('throttle:20,1');
+
     // CSV downloads (own data only)
     Route::get('/retailer/export/wallet-ledger', [RetailerExportController::class, 'ledger'])->middleware('throttle:10,1');
     Route::get('/retailer/export/verifications', [RetailerExportController::class, 'verifications'])->middleware('throttle:10,1');
 
     // Single verifications (max 30 checks per minute per retailer)
     Route::get('/retailer/services', [VerificationController::class, 'services']);
+    Route::get('/retailer/services/{code}', [VerificationController::class, 'show'])->where('code', '[A-Za-z_]+');
     Route::get('/retailer/verifications', [VerificationController::class, 'index']);
     Route::post('/retailer/verifications', [VerificationController::class, 'store'])->middleware('throttle:30,1');
     Route::get('/retailer/verifications/{id}/receipt', [ReportPdfController::class, 'receipt'])->whereNumber('id')->middleware('throttle:20,1');

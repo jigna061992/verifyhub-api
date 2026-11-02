@@ -106,7 +106,7 @@ class HistoryController extends Controller
             'id'               => $v->id,
             'service_code'     => $v->service?->code,
             'service_name'     => $v->service?->name,
-            'customer_name'    => null,
+            'customer_name'    => $v->meta['customer_name'] ?? null,
             'status'           => $v->status,
             'input_masked'     => $v->input_masked,
             'price'            => (float) $v->price,

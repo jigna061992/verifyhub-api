@@ -2,8 +2,7 @@
 <phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
          bootstrap="vendor/autoload.php"
-         colors="true"
->
+         colors="true">
     <testsuites>
         <testsuite name="Unit">
             <directory>tests/Unit</directory>
@@ -19,18 +18,21 @@
     </source>
     <php>
         <env name="APP_ENV" value="testing"/>
+        <env name="APP_KEY" value="base64:dmVyaWZ5aHViLXRlc3Rpbmcta2V5LTMyLWJ5dGVzISE="/>
         <env name="APP_MAINTENANCE_DRIVER" value="file"/>
         <env name="BCRYPT_ROUNDS" value="4"/>
-        <env name="BROADCAST_CONNECTION" value="null"/>
         <env name="CACHE_STORE" value="array"/>
+        <!-- Tests NEVER touch the MySQL dev database -->
         <env name="DB_CONNECTION" value="sqlite"/>
         <env name="DB_DATABASE" value=":memory:"/>
-        <env name="DB_URL" value=""/>
         <env name="MAIL_MAILER" value="array"/>
         <env name="QUEUE_CONNECTION" value="sync"/>
         <env name="SESSION_DRIVER" value="array"/>
-        <env name="PULSE_ENABLED" value="false"/>
-        <env name="TELESCOPE_ENABLED" value="false"/>
-        <env name="NIGHTWATCH_ENABLED" value="false"/>
+        <env name="VERIFICATION_PROVIDER" value="mock"/>
+        <env name="KYC_PROVIDER" value="mock"/>
+        <env name="RAZORPAY_KEY_ID" value="rzp_test_dummy"/>
+        <env name="RAZORPAY_KEY_SECRET" value="test_key_secret"/>
+        <env name="RAZORPAY_WEBHOOK_SECRET" value="test_webhook_secret"/>
+        <env name="RAZORPAY_ALLOW_LIVE" value="false"/>
     </php>
 </phpunit>

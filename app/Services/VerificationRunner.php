@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Retailer;
 use App\Models\RetailerPricing;
 use App\Models\Verification;
+use App\Models\VerificationConsent;
 use App\Models\VerificationService;
 use App\Services\Providers\ProviderResult;
 use App\Services\Providers\VerificationProvider;
@@ -34,21 +35,44 @@ class VerificationRunner
         return round((float) ($custom ?? $service->default_price), 2);
     }
 
-    public function run(Retailer $retailer, VerificationService $service, array $input): Verification
+    /**
+     * @param array $options optional: customer_name (name match + shown in history), consent [text, version, purpose, user_id, ip, user_agent]
+     */
+    public function run(Retailer $retailer, VerificationService $service, array $input, array $options = []): Verification
     {
         $price = $this->priceFor($retailer, $service);
 
         // 1. Create the record and hold the money in one transaction
-        $verification = DB::transaction(function () use ($retailer, $service, $input, $price) {
+        $verification = DB::transaction(function () use ($retailer, $service, $input, $price, $options) {
             $v = Verification::create([
                 'retailer_id'   => $retailer->id,
                 'service_id'    => $service->id,
                 'reference'     => (string) Str::uuid(),
                 'status'        => 'pending',
                 'input_masked'  => $this->mask($service->code, $input),
+                'meta'          => ! empty($options['customer_name']) ? ['customer_name' => $options['customer_name']] : null,
                 'price'         => $price,
                 'provider_cost' => $service->provider_cost,
             ]);
+
+            // The consent the retailer ticked is logged with the check (same table as Aadhaar / e-Sign)
+            if (! empty($options['consent'])) {
+                $c = $options['consent'];
+
+                VerificationConsent::create([
+                    'verification_id' => $v->id,
+                    'type'            => 'collection',
+                    'purpose'         => $c['purpose'],
+                    'text_version'    => (string) $c['version'],
+                    'text_hash'       => hash('sha256', $c['text']),
+                    'text'            => $c['text'],
+                    'channel'         => 'retailer_assisted',
+                    'accepted_by'     => $c['user_id'],
+                    'ip_address'      => $c['ip'],
+                    'user_agent'      => $c['user_agent'],
+                    'accepted_at'     => now(),
+                ]);
+            }
 
             if ($price > 0) {
                 $this->wallets->reserve(
@@ -67,11 +91,18 @@ class VerificationRunner
             $result = $this->provider()->verify($service->code, $input);
         } catch (Throwable $e) {
             report($e);
+
+            // The provider may or may not have processed the request. Do not guess: keep the money on hold
+            // and let an admin reconcile it (Admin > Reconciliation). Free checks have nothing to hold.
+            if ($price > 0 && config('verification.reconciliation_enabled', true)) {
+                return app(ReconciliationService::class)->hold($verification, 'Provider call failed (' . class_basename($e) . ')');
+            }
+
             $result = ProviderResult::failed('Verification service is not responding. Please try again. You were not charged.');
         }
 
         // 3. Settle the money and save the result
-        DB::transaction(function () use ($verification, $retailer, $service, $result, $price) {
+        DB::transaction(function () use ($verification, $retailer, $service, $result, $price, $options) {
             if ($result->success) {
                 if ($price > 0) {
                     $this->wallets->debit(
@@ -84,7 +115,7 @@ class VerificationRunner
 
                 $verification->update([
                     'status'       => 'success',
-                    'result'       => $result->data,
+                    'result'       => $this->withNameMatch($service->code, $result->data, $options['customer_name'] ?? null),
                     'provider_ref' => $result->providerRef,
                 ]);
             } else {
@@ -106,6 +137,30 @@ class VerificationRunner
         });
 
         return $verification->fresh();
+    }
+
+    // When the retailer typed the customer name, compare it with the name the provider returned.
+    // This is only extra information: a mismatch does not fail the check or change the charge.
+    private function withNameMatch(string $code, array $data, ?string $given): array
+    {
+        $given = trim((string) $given);
+        $field = match ($code) {
+            'PAN'  => 'name',
+            'BANK' => 'account_holder',
+            'GST'  => 'legal_name',
+            default => null,
+        };
+
+        if ($given === '' || ! $field || empty($data[$field])) {
+            return $data;
+        }
+
+        $score = NameMatcher::score($given, (string) $data[$field]);
+
+        return $data + [
+            'name_match_score' => $score,
+            'name_match'       => $score >= (int) config('kyc.name_match.' . strtolower($code), 80) ? 'match' : 'mismatch',
+        ];
     }
 
     private function provider(): VerificationProvider

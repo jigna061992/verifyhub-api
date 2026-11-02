@@ -6,6 +6,7 @@ use App\Exceptions\InsufficientBalanceException;
 use App\Http\Controllers\Controller;
 use App\Models\Retailer;
 use App\Models\WalletLedger;
+use App\Services\NotificationService;
 use App\Services\WalletService;
 use App\Support\Audit;
 use App\Support\Csv;
@@ -98,6 +99,8 @@ class AdminWalletController extends Controller
         }
 
         if (! $already) {
+            app(NotificationService::class)->walletAdjusted($retailer->id, $data['type'], (float) $data['amount']);
+
             Audit::log($request, 'wallet.adjusted', 'wallet', $entry->wallet_id, [
                 'retailer_id'   => $retailer->id,
                 'type'          => $data['type'],

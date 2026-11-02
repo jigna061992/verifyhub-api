@@ -35,4 +35,18 @@ return [
         ],
     ],
 
+    // Online wallet top-up. Development uses TEST keys only (rzp_test_...), so no real money moves.
+    'razorpay' => [
+        'key_id'         => env('RAZORPAY_KEY_ID'),
+        'key_secret'     => env('RAZORPAY_KEY_SECRET'),
+        'webhook_secret' => env('RAZORPAY_WEBHOOK_SECRET'),
+
+        // Safety switch: live keys (rzp_live_...) are refused unless this is true. Keep it false while developing.
+        'allow_live'     => (bool) env('RAZORPAY_ALLOW_LIVE', false),
+
+        'min_amount'     => (int) env('RAZORPAY_MIN_AMOUNT', 100),
+        'max_amount'     => (int) env('RAZORPAY_MAX_AMOUNT', 100000),
+        'api_url'        => 'https://api.razorpay.com/v1',
+    ],
+
 ];
