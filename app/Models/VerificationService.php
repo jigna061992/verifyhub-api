@@ -14,6 +14,14 @@ class VerificationService extends Model
         return ['enabled' => 'boolean'];
     }
 
+    // Services that were removed from the product. They are hidden from every admin list.
+    public const RETIRED_CODES = ['GST'];
+
+    public function scopeActive($query)
+    {
+        return $query->whereNotIn('code', self::RETIRED_CODES);
+    }
+
     // All checks done with this service (used for usage and success rate)
     public function verifications(): HasMany
     {

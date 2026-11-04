@@ -28,6 +28,13 @@ class VerificationRunner
     // Retailer custom price if set, otherwise the default price. The server always decides the price.
     public function priceFor(Retailer $retailer, VerificationService $service): float
     {
+        // Complete KYC is never priced by hand: it is the sum of its 4 services for this retailer
+        $bundle = app(BundlePricing::class);
+
+        if ($bundle->isBundle($service)) {
+            return $bundle->priceFor($retailer);
+        }
+
         $custom = RetailerPricing::where('retailer_id', $retailer->id)
             ->where('service_id', $service->id)
             ->value('custom_price');

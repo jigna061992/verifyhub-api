@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Retailer;
+use App\Models\WalletLedger;
+use App\Models\Reconciliation;
 use App\Models\RetailerPricing;
 use App\Models\User;
 use App\Models\Verification;
@@ -15,6 +17,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\Rules\Password;
 use App\Models\KycCase;
+use App\Services\BundlePricing;
 
 class AdminController extends Controller
 {
@@ -27,11 +30,189 @@ class AdminController extends Controller
 
     public function dashboardStats()
     {
-        $pendingTopups = WalletTopupRequest::with('retailer:id,business_name')
-            ->where('status', 'pending')
-            ->latest()
-            ->take(5)
+        $now    = now();
+        $driver = DB::connection()->getDriverName();
+        $monthSql = $driver === 'sqlite' ? "strftime('%Y-%m', created_at)" : "DATE_FORMAT(created_at, '%Y-%m')";
+
+        $since30 = $now->copy()->subDays(30);
+        $since60 = $now->copy()->subDays(60);
+
+        // Percentage change between two numbers (null when there is nothing to compare with)
+        $change = fn ($current, $previous) => $previous > 0 ? round(($current - $previous) / $previous * 100, 1) : null;
+
+        /* ---------- Retailers ---------- */
+        $rTotal  = Retailer::count();
+        $rActive = Retailer::where('status', 'active')->count();
+
+        /* ---------- Verifications (single checks) ---------- */
+        $vTotal   = Verification::count();
+        $vSuccess = Verification::where('status', 'success')->count();
+        $vFailed  = Verification::where('status', 'failed')->count();
+        $vPending = Verification::where('status', 'pending')->count();
+
+        $last30 = Verification::where('created_at', '>=', $since30)->count();
+        $prev30 = Verification::whereBetween('created_at', [$since60, $since30])->count();
+
+        $okLast30 = Verification::where('status', 'success')->where('created_at', '>=', $since30)->count();
+        $okPrev30 = Verification::where('status', 'success')->whereBetween('created_at', [$since60, $since30])->count();
+
+        $failLast30 = Verification::where('status', 'failed')->where('created_at', '>=', $since30)->count();
+        $failPrev30 = Verification::where('status', 'failed')->whereBetween('created_at', [$since60, $since30])->count();
+
+        /* ---------- Money: single checks + completed Complete KYC cases ---------- */
+        $revenueOf = fn ($from = null, $to = null) =>
+            (float) Verification::where('status', 'success')
+                ->when($from, fn ($q) => $q->where('created_at', '>=', $from))
+                ->when($to, fn ($q) => $q->where('created_at', '<', $to))
+                ->sum('price')
+            + (float) KycCase::where('status', 'completed')
+                ->when($from, fn ($q) => $q->where('created_at', '>=', $from))
+                ->when($to, fn ($q) => $q->where('created_at', '<', $to))
+                ->sum('price');
+
+        $costOf = fn ($from = null, $to = null) =>
+            (float) Verification::where('status', 'success')
+                ->when($from, fn ($q) => $q->where('created_at', '>=', $from))
+                ->when($to, fn ($q) => $q->where('created_at', '<', $to))
+                ->sum('provider_cost')
+            + (float) KycCase::where('status', 'completed')
+                ->when($from, fn ($q) => $q->where('created_at', '>=', $from))
+                ->when($to, fn ($q) => $q->where('created_at', '<', $to))
+                ->sum('provider_cost');
+
+        $revenueAll = $revenueOf();
+        $rev30      = $revenueOf($since30);
+        $revPrev30  = $revenueOf($since60, $since30);
+        $margin30   = $rev30 - $costOf($since30);
+
+        /* ---------- Today ---------- */
+        $todayStart = $now->copy()->startOfDay();
+        $todayCount = Verification::where('created_at', '>=', $todayStart)->count();
+        $todayBilled = $revenueOf($todayStart);
+        $avg7 = Verification::whereBetween('created_at', [$now->copy()->subDays(7)->startOfDay(), $todayStart])->count() / 7;
+
+        /* ---------- Wallet ---------- */
+        $ledgerCount    = WalletLedger::count();
+        $ledgerCount30  = WalletLedger::where('created_at', '>=', $since30)->count();
+        $ledgerPrev30   = WalletLedger::whereBetween('created_at', [$since60, $since30])->count();
+        $totalCredited  = (float) WalletLedger::where('type', 'credit')->sum('amount');
+
+        /* ---------- Last 6 months ---------- */
+        $months = collect(range(5, 0))->map(fn ($i) => $now->copy()->startOfMonth()->subMonths($i));
+        $from6  = $months->first();
+
+        $vByMonth = Verification::where('created_at', '>=', $from6)
+            ->selectRaw("{$monthSql} as m, status, COUNT(*) as c, SUM(CASE WHEN status = 'success' THEN price ELSE 0 END) as rev, SUM(CASE WHEN status = 'success' THEN provider_cost ELSE 0 END) as cost")
+            ->groupBy('m', 'status')
             ->get()
+            ->groupBy('m');
+
+        $kByMonth = KycCase::where('status', 'completed')->where('created_at', '>=', $from6)
+            ->selectRaw("{$monthSql} as m, SUM(price) as rev, SUM(provider_cost) as cost")
+            ->groupBy('m')
+            ->get()
+            ->keyBy('m');
+
+        $trend = [];
+        $revenueChart = [];
+
+        foreach ($months as $month) {
+            $key  = $month->format('Y-m');
+            $rows = $vByMonth[$key] ?? collect();
+            $count = fn ($status) => (int) optional($rows->firstWhere('status', $status))->c;
+
+            $rev  = (float) $rows->sum('rev') + (float) optional($kByMonth[$key] ?? null)->rev;
+            $cost = (float) $rows->sum('cost') + (float) optional($kByMonth[$key] ?? null)->cost;
+
+            $trend[] = [
+                'label'    => $month->format('M'),
+                'verified' => $count('success'),
+                'failed'   => $count('failed'),
+                'pending'  => $count('pending'),
+            ];
+
+            $revenueChart[] = [
+                'label'   => $month->format('M'),
+                'revenue' => round($rev, 2),
+                'cost'    => round($cost, 2),
+                'margin'  => round($rev - $cost, 2),
+            ];
+        }
+
+        /* ---------- Per service: share and success rate ---------- */
+        $perService = Verification::join('verification_services as s', 's.id', '=', 'verifications.service_id')
+            ->selectRaw("s.code, s.name, COUNT(*) as total, SUM(CASE WHEN verifications.status = 'success' THEN 1 ELSE 0 END) as ok, SUM(CASE WHEN verifications.status = 'failed' THEN 1 ELSE 0 END) as bad")
+            ->groupBy('s.code', 's.name')
+            ->get();
+
+        $kycTotal = KycCase::count();
+        $kycDone  = KycCase::where('status', 'completed')->count();
+        $kycBad   = KycCase::whereIn('status', ['failed', 'expired'])->count();
+
+        $categories = $perService->map(fn ($r) => ['code' => $r->code, 'name' => $r->name, 'total' => (int) $r->total]);
+        if ($kycTotal > 0) {
+            $categories->push(['code' => 'COMPLETE_KYC', 'name' => 'Complete KYC', 'total' => $kycTotal]);
+        }
+
+        $catSum = max((int) $categories->sum('total'), 1);
+        $categories = $categories->sortByDesc('total')->values()->map(fn ($c) => $c + ['percent' => (int) round($c['total'] / $catSum * 100)]);
+
+        $successByService = $perService->map(function ($r) {
+            $done = (int) $r->ok + (int) $r->bad;
+
+            return ['code' => $r->code, 'name' => $r->name, 'rate' => $done ? round($r->ok / $done * 100, 1) : null];
+        });
+        if ($kycDone + $kycBad > 0) {
+            $successByService->push(['code' => 'COMPLETE_KYC', 'name' => 'Complete KYC', 'rate' => round($kycDone / ($kycDone + $kycBad) * 100, 1)]);
+        }
+
+        /* ---------- Verifications per day (last 7 days) ---------- */
+        $daily = Verification::where('created_at', '>=', $now->copy()->subDays(6)->startOfDay())
+            ->selectRaw('DATE(created_at) as d, COUNT(*) as c')
+            ->groupBy('d')
+            ->pluck('c', 'd');
+
+        $chart = collect(range(6, 0))->map(function ($d) use ($daily, $now) {
+            $day = $now->copy()->subDays($d);
+
+            return ['label' => $day->format('D'), 'total' => (int) ($daily[$day->toDateString()] ?? 0)];
+        })->values();
+
+        /* ---------- Lists ---------- */
+        $recent = Verification::with('retailer:id,business_name', 'service:id,code,name')
+            ->latest()->take(8)->get()
+            ->map(fn ($v) => [
+                'id'            => $v->id,
+                'reference'     => strtoupper('VRF' . substr(str_replace('-', '', $v->reference), 0, 10)),
+                'business_name' => $v->retailer?->business_name,
+                'service_code'  => $v->service?->code,
+                'service_name'  => $v->service?->name,
+                'document'      => $v->input_masked,
+                'status'        => $v->status,
+                'amount'        => (float) $v->price,
+                'created_at'    => $v->created_at->toIso8601String(),
+            ]);
+
+        $topMap = Verification::where('status', 'success')->where('created_at', '>=', $since30)
+            ->selectRaw('retailer_id, SUM(price) as billed, COUNT(*) as checks')->groupBy('retailer_id')->get()
+            ->keyBy('retailer_id')
+            ->map(fn ($r) => ['billed' => (float) $r->billed, 'checks' => (int) $r->checks]);
+
+        KycCase::where('status', 'completed')->where('created_at', '>=', $since30)
+            ->selectRaw('retailer_id, SUM(price) as billed, COUNT(*) as checks')->groupBy('retailer_id')->get()
+            ->each(function ($r) use ($topMap) {
+                $old = $topMap[$r->retailer_id] ?? ['billed' => 0, 'checks' => 0];
+                $topMap[$r->retailer_id] = ['billed' => $old['billed'] + (float) $r->billed, 'checks' => $old['checks'] + (int) $r->checks];
+            });
+
+        $topIds   = $topMap->sortByDesc('billed')->take(5);
+        $names    = Retailer::whereIn('id', $topIds->keys())->pluck('business_name', 'id');
+        $topRetailers = $topIds->map(fn ($r, $id) => [
+            'id' => $id, 'business_name' => $names[$id] ?? '-', 'billed' => $r['billed'], 'checks' => $r['checks'],
+        ])->values();
+
+        $pendingTopups = WalletTopupRequest::with('retailer:id,business_name')
+            ->where('status', 'pending')->latest()->take(5)->get()
             ->map(fn ($t) => [
                 'id'            => $t->id,
                 'business_name' => $t->retailer?->business_name,
@@ -41,9 +222,7 @@ class AdminController extends Controller
             ]);
 
         $recentRetailers = Retailer::with('user:id,name,mobile', 'wallet:id,retailer_id,available_balance')
-            ->latest()
-            ->take(5)
-            ->get()
+            ->latest()->take(5)->get()
             ->map(fn ($r) => [
                 'id'            => $r->id,
                 'business_name' => $r->business_name,
@@ -53,45 +232,96 @@ class AdminController extends Controller
                 'status'        => $r->status,
             ]);
 
-        // Verifications per day for the last 7 days
-        $daily = Verification::where('created_at', '>=', now()->subDays(6)->startOfDay())
-            ->selectRaw('DATE(created_at) as d, COUNT(*) as c')
-            ->groupBy('d')
-            ->pluck('c', 'd');
+        /* ---------- Alerts: things that need the admin's attention ---------- */
+        $alerts = [];
 
-        $chart = collect(range(6, 0))->map(function ($d) use ($daily) {
-            $day = now()->subDays($d);
-
-            return [
-                'label' => $day->format('D'),
-                'total' => (int) ($daily[$day->toDateString()] ?? 0),
+        foreach (WalletTopupRequest::with('retailer:id,business_name')->where('status', 'pending')->latest()->take(3)->get() as $t) {
+            $alerts[] = [
+                'type' => 'topup', 'severity' => 'info', 'link' => '/admin/wallet',
+                'title' => 'Fund request · ₹' . number_format((float) $t->amount),
+                'message' => $t->retailer?->business_name, 'created_at' => $t->created_at->toIso8601String(),
             ];
-        })->values();
+        }
 
-        $vTotal   = Verification::count();
-        $vSuccess = Verification::where('status', 'success')->count();
+        $openRecon = Reconciliation::where('status', 'open')->count();
+        if ($openRecon > 0) {
+            $alerts[] = [
+                'type' => 'reconciliation', 'severity' => 'warning', 'link' => '/admin/reconciliation',
+                'title' => $openRecon . ' check(s) waiting for reconciliation',
+                'message' => 'Provider answer is unknown. The money is still on hold.', 'created_at' => null,
+            ];
+        }
+
+        $threshold  = (float) config('verification.low_balance_threshold', 500);
+        $lowBalance = Retailer::where('status', 'active')
+            ->whereHas('wallet', fn ($q) => $q->where('available_balance', '<', $threshold))->count();
+        if ($lowBalance > 0) {
+            $alerts[] = [
+                'type' => 'low_balance', 'severity' => 'warning', 'link' => '/admin/wallets',
+                'title' => $lowBalance . ' retailer(s) with low balance',
+                'message' => 'Wallet is below ₹' . number_format($threshold), 'created_at' => null,
+            ];
+        }
+
+        $day = Verification::where('created_at', '>=', $now->copy()->subDay());
+        $dayTotal  = (clone $day)->whereIn('status', ['success', 'failed'])->count();
+        $dayFailed = (clone $day)->where('status', 'failed')->count();
+        if ($dayTotal >= 5 && $dayFailed / $dayTotal >= 0.25) {
+            $alerts[] = [
+                'type' => 'failures', 'severity' => 'danger', 'link' => '/admin/verifications',
+                'title' => 'High failure rate in the last 24 hours',
+                'message' => "{$dayFailed} of {$dayTotal} checks failed.", 'created_at' => null,
+            ];
+        }
 
         return response()->json([
             'retailers' => [
-                'total'    => Retailer::count(),
-                'active'   => Retailer::where('status', 'active')->count(),
-                'inactive' => Retailer::where('status', 'inactive')->count(),
+                'total'      => $rTotal,
+                'active'     => $rActive,
+                'inactive'   => Retailer::where('status', 'inactive')->count(),
+                'new_30d'    => Retailer::where('created_at', '>=', $since30)->count(),
+                'active_pct' => $rTotal ? (int) round($rActive / $rTotal * 100) : 0,
             ],
             'wallet' => [
                 'total_balance'         => (float) Wallet::sum('available_balance'),
                 'pending_topups_count'  => WalletTopupRequest::where('status', 'pending')->count(),
                 'pending_topups_amount' => (float) WalletTopupRequest::where('status', 'pending')->sum('amount'),
+                'transactions'          => $ledgerCount,
+                'transactions_change'   => $change($ledgerCount30, $ledgerPrev30),
+                'total_credited'        => $totalCredited,
             ],
             'verifications' => [
-                'total'        => $vTotal,
-                'success_rate' => $vTotal ? round($vSuccess / $vTotal * 100, 1) : null,
-                // 'revenue'      => (float) Verification::where('status', 'success')->sum('price'),
-                'revenue' => (float) Verification::where('status', 'success')->sum('price')
-                                + (float) KycCase::where('status', 'completed')->sum('price'),
-                ],
-            'chart'            => $chart,
-            'pending_topups'   => $pendingTopups,
-            'recent_retailers' => $recentRetailers,
+                'total'           => $vTotal,
+                'success'         => $vSuccess,
+                'failed'          => $vFailed,
+                'pending'         => $vPending,
+                'success_rate'    => $vTotal ? round($vSuccess / $vTotal * 100, 1) : null,
+                'failed_share'    => $vTotal ? round($vFailed / $vTotal * 100, 1) : null,
+                'total_change'    => $change($last30, $prev30),
+                'success_change'  => $change($okLast30, $okPrev30),
+                'failed_change'   => $change($failLast30, $failPrev30),
+                'revenue'         => $revenueAll,
+                'revenue_change'  => $change($rev30, $revPrev30),
+            ],
+            'today' => [
+                'transactions' => $todayCount,
+                'billed'       => $todayBilled,
+                'pace_change'  => $avg7 > 0 ? round(($todayCount - $avg7) / $avg7 * 100, 1) : null,
+            ],
+            'margin' => [
+                'amount'  => round($margin30, 2),
+                'percent' => $rev30 > 0 ? round($margin30 / $rev30 * 100, 1) : null,
+            ],
+            'trend'             => $trend,
+            'categories'        => $categories,
+            'revenue_chart'     => $revenueChart,
+            'success_by_service' => $successByService->values(),
+            'recent_verifications' => $recent,
+            'top_retailers'     => $topRetailers,
+            'alerts'            => $alerts,
+            'chart'             => $chart,
+            'pending_topups'    => $pendingTopups,
+            'recent_retailers'  => $recentRetailers,
         ]);
     }
 
@@ -255,7 +485,7 @@ class AdminController extends Controller
 
     public function services()
     {
-        return VerificationService::orderBy('id')->get()->map(fn ($s) => $this->serviceRow($s));
+        return VerificationService::active()->orderBy('id')->get()->map(fn ($s) => $this->serviceRow($s));
     }
 
     public function updateService(Request $request, $id)
@@ -268,7 +498,13 @@ class AdminController extends Controller
             'enabled'       => 'sometimes|boolean',
         ]);
 
+        // Complete KYC price and cost are calculated from its 4 services. Only "enabled" can be changed by hand.
+        if (app(BundlePricing::class)->isBundle($service) && (isset($data['default_price']) || isset($data['provider_cost']))) {
+            return response()->json(['message' => 'The Complete KYC price is calculated automatically from Aadhaar, PAN, Bank and e-Sign.'], 422);
+        }
+
         $service->update($data);
+        app(BundlePricing::class)->sync();
 
         $this->audit($request, 'service.updated', 'verification_service', $service->id, $data);
 
@@ -282,18 +518,23 @@ class AdminController extends Controller
 
         $custom = RetailerPricing::where('retailer_id', $retailer->id)->pluck('custom_price', 'service_id');
 
-        $services = VerificationService::orderBy('id')->get()->map(function ($s) use ($custom) {
-            $customPrice = isset($custom[$s->id]) ? (float) $custom[$s->id] : null;
+        $bundle = app(BundlePricing::class);
+
+        $services = VerificationService::active()->orderBy('id')->get()->map(function ($s) use ($custom, $retailer, $bundle) {
+            $auto        = $bundle->isBundle($s);
+            $customPrice = ! $auto && isset($custom[$s->id]) ? (float) $custom[$s->id] : null;
 
             return [
                 'service_id'      => $s->id,
                 'code'            => $s->code,
                 'name'            => $s->name,
                 'enabled'         => (bool) $s->enabled,
+                'auto_price'      => $auto,
                 'provider_cost'   => (float) $s->provider_cost,
                 'default_price'   => (float) $s->default_price,
                 'custom_price'    => $customPrice,
-                'effective_price' => $customPrice ?? (float) $s->default_price,
+                // Complete KYC: the sum of this retailer's prices of the 4 services
+                'effective_price' => $auto ? $bundle->priceFor($retailer) : ($customPrice ?? (float) $s->default_price),
             ];
         });
 
@@ -307,6 +548,10 @@ class AdminController extends Controller
     {
         $retailer = Retailer::findOrFail($id);
         $service  = VerificationService::findOrFail($serviceId);
+
+        if (app(BundlePricing::class)->isBundle($service)) {
+            return response()->json(['message' => 'The Complete KYC price is calculated automatically. Change the price of its 4 services instead.'], 422);
+        }
 
         $data = $request->validate([
             'custom_price' => 'required|numeric|min:0|max:100000',
@@ -357,7 +602,7 @@ class AdminController extends Controller
             ->get()
             ->keyBy('service_id');
 
-        $services = VerificationService::orderBy('id')->get()->map(function ($s) use ($usage) {
+        $services = VerificationService::active()->orderBy('id')->get()->map(function ($s) use ($usage) {
             $u = $usage->get($s->id);
 
             return $this->serviceRow($s) + [
@@ -419,6 +664,11 @@ class AdminController extends Controller
             foreach ($data['services'] as $row) {
                 $service = VerificationService::findOrFail($row['id']);
 
+                // Complete KYC is calculated, never saved by hand
+                if (app(BundlePricing::class)->isBundle($service)) {
+                    continue;
+                }
+
                 $price = round((float) $row['default_price'], 2);
                 $cost  = round((float) $row['provider_cost'], 2);
 
@@ -428,6 +678,9 @@ class AdminController extends Controller
                 }
             }
         });
+
+        // The Complete KYC price and cost follow the 4 services
+        app(BundlePricing::class)->sync();
 
         if ($changes) {
             $this->audit($request, 'pricing.defaults_saved', 'verification_service', 0, $changes);
@@ -454,6 +707,11 @@ class AdminController extends Controller
             foreach ($data['prices'] as $row) {
                 $service = $services[$row['service_id']];
                 $price   = round((float) $row['price'], 2);
+
+                // Complete KYC is calculated, never saved by hand
+                if (app(BundlePricing::class)->isBundle($service)) {
+                    continue;
+                }
 
                 $existing = RetailerPricing::where('retailer_id', $retailer->id)->where('service_id', $service->id)->first();
 
@@ -519,6 +777,7 @@ class AdminController extends Controller
             'name'          => $s->name,
             'provider'      => $s->provider,
             'enabled'       => (bool) $s->enabled,
+            'auto_price'    => app(BundlePricing::class)->isBundle($s),
             'default_price' => (float) $s->default_price,
             'provider_cost' => (float) $s->provider_cost,
         ];

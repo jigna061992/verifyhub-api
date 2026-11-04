@@ -16,19 +16,18 @@ use Illuminate\Validation\Rule;
 class VerificationController extends Controller
 {
     private const PAN_REGEX  = '/^[A-Z]{5}[0-9]{4}[A-Z]$/';
-    private const GST_REGEX  = '/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/';
     private const IFSC_REGEX = '/^[A-Z]{4}0[A-Z0-9]{6}$/';
 
     // One-call checks (this controller)
-    public const SUPPORTED = ['PAN', 'BANK', 'GST'];
+    public const SUPPORTED = ['PAN', 'BANK'];
 
     // Checks with more than one step (VerificationSessionController): Aadhaar OTP, e-Sign
     public const SESSION = ['AADHAAR', 'ESIGN'];
 
     // Every single check a retailer can see in lists and filters
-    public const ALL = ['PAN', 'BANK', 'AADHAAR', 'GST', 'ESIGN'];
+    public const ALL = ['PAN', 'BANK', 'AADHAAR', 'ESIGN'];
 
-    // Consent shown for PAN / Bank / GST (Aadhaar and e-Sign use config('verification.consent.*'))
+    // Consent shown for PAN / Bank (Aadhaar and e-Sign use config('verification.consent.*'))
     private const DEFAULT_CONSENT = [
         'version' => 'v1',
         'text'    => 'I confirm that the customer has given explicit consent for this verification, and it is being performed for a lawful KYC purpose ({purpose}) in line with the acceptable use policy of {retailer}.',
@@ -71,7 +70,7 @@ class VerificationController extends Controller
             'purposes'         => collect(config('kyc.purposes'))->map(fn ($label, $key) => ['value' => $key, 'label' => $label])->values(),
             'consent'          => $this->consentFor($code),
             'ttl_minutes'      => $session ? (int) config('verification.sessions.' . strtolower($code) . '_ttl_minutes') : null,
-            'name_match'       => in_array($code, ['PAN', 'BANK', 'GST', 'AADHAAR'], true),
+            'name_match'       => in_array($code, ['PAN', 'BANK', 'AADHAAR'], true),
             'dev_mode'         => $dev,
             'samples'          => $dev ? $this->samplesFor($code) : [],
         ]);
@@ -228,10 +227,6 @@ class VerificationController extends Controller
                 ['label' => 'Account not found', 'values' => ['account_number' => '123456789010', 'ifsc' => 'SBIN0001234']],
                 ['label' => 'Provider timeout',  'values' => ['account_number' => '123456789019', 'ifsc' => 'SBIN0001234']],
             ],
-            'GST' => [
-                ['label' => 'Valid GSTIN',       'values' => ['gstin' => '24ABCPK1234L1Z5']],
-                ['label' => 'GSTIN not found',   'values' => ['gstin' => '24ABCPK1234L1Z0']],
-            ],
             'AADHAAR' => [
                 ['label' => 'Valid Aadhaar',     'values' => ['aadhaar' => '234567890121']],
                 ['label' => 'Not found',         'values' => ['aadhaar' => '234567890120']],
@@ -256,10 +251,6 @@ class VerificationController extends Controller
                     'account_number.regex' => 'Account number must be 9 to 18 digits.',
                     'ifsc.regex'           => 'IFSC code is invalid (example: SBIN0001234).',
                 ],
-            ],
-            'GST' => [
-                ['gstin' => ['required', 'regex:' . self::GST_REGEX]],
-                ['gstin.regex' => 'GST number format is invalid.'],
             ],
         };
     }

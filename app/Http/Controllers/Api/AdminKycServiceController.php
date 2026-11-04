@@ -10,7 +10,7 @@ class AdminKycServiceController extends Controller
 {
     public function index()
     {
-        $services = VerificationService::orderBy('id')
+        $services = VerificationService::active()->orderBy('id')
             ->withCount([
                 'verifications as total_usage',
                 'verifications as success_count' => fn ($q) => $q->where('status', 'success'),

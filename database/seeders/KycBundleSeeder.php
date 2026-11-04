@@ -16,9 +16,12 @@ class KycBundleSeeder extends Seeder
                 'name'          => 'Complete KYC (Aadhaar + PAN + Bank + e-Sign)',
                 'provider'      => 'mock',
                 'enabled'       => true,
-                'default_price' => 32,   // single checks would cost 10 + 5 + 8 + 15 = 38
-                'provider_cost' => 23,   // 6 + 3 + 5 + 9
+                'default_price' => 0,    // set below: always the sum of the 4 services (see BundlePricing)
+                'provider_cost' => 0,    // set below: always the sum of the 4 services
             ]
         );
+
+        // Complete KYC price and cost = Aadhaar + PAN + Bank + e-Sign (run ServiceSeeder first)
+        app(\App\Services\BundlePricing::class)->sync();
     }
 }

@@ -63,7 +63,10 @@ class KycService
 
     public function bundleService(): ?VerificationService
     {
-        return VerificationService::where('code', config('kyc.service_code'))->where('enabled', true)->first();
+        $bundle = VerificationService::where('code', config('kyc.service_code'))->where('enabled', true)->first();
+
+        // Complete KYC needs all 4 services. If one of them is switched off, the bundle is not available.
+        return $bundle && app(BundlePricing::class)->allPartsEnabled() ? $bundle : null;
     }
 
     // Retailer custom price if set, otherwise the default price. null = service is switched off.
@@ -103,7 +106,7 @@ class KycService
                 'customer_mobile'       => $data['customer_mobile'],
                 'customer_mobile_last4' => substr($data['customer_mobile'], -4),
                 'price'                 => $price,
-                'provider_cost'         => $service->provider_cost,
+                'provider_cost'         => app(BundlePricing::class)->providerCost(),
                 'expires_at'            => now()->addMinutes((int) config('kyc.case_ttl_minutes')),
             ]);
 

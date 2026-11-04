@@ -32,7 +32,9 @@ class RetailerController extends Controller
             'code'  => $s->code,
             'name'  => $s->name,
             // Server decides the price, the frontend only displays it
-            'price' => (float) ($customPrices[$s->id] ?? $s->default_price),
+            'price' => app(\App\Services\BundlePricing::class)->isBundle($s)
+                ? app(\App\Services\BundlePricing::class)->priceFor($retailer)
+                : (float) ($customPrices[$s->id] ?? $s->default_price),
         ]);
 
         $topups = WalletTopupRequest::where('retailer_id', $retailer->id);
