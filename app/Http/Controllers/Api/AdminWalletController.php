@@ -11,10 +11,16 @@ use App\Services\WalletService;
 use App\Support\Audit;
 use App\Support\Csv;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 
 // Super Admin: see every retailer wallet, add or deduct money by hand (always with a reason + audit), export statements
 class AdminWalletController extends Controller
 {
+    // How the money reached us (shown in the "Payment mode" list of the adjustment form)
+    public const PAYMENT_MODES = ['NEFT', 'IMPS', 'RTGS', 'UPI', 'CASH', 'CHEQUE', 'OTHER'];
+
     public function __construct(private WalletService $wallets)
     {
     }
@@ -35,6 +41,7 @@ class AdminWalletController extends Controller
 
         return $query->paginate($perPage)->through(fn ($r) => [
             'retailer_id'   => $r->id,
+            'code'          => 'RT' . (1000 + $r->id),
             'business_name' => $r->business_name,
             'owner'         => $r->user?->name,
             'status'        => $r->status,
@@ -59,41 +66,65 @@ class AdminWalletController extends Controller
                 'amount'        => (float) $l->amount,
                 'balance_after' => (float) $l->balance_after,
                 'description'   => $l->description,
+                'payment_mode'  => $l->payment_mode,
+                'txn_reference' => $l->txn_reference,
                 'created_at'    => $l->created_at?->toIso8601String(),
             ]);
     }
 
     /**
      * POST /admin/wallets/{id}/adjust
-     * { type: credit|debit, amount, reason, request_key (uuid made by the screen when the form opens) }
+     * { type: credit|debit, amount, payment_mode, txn_reference, remarks?, request_key (uuid made by the screen when the form opens) }
+     * "reason" is still accepted as the old name of "remarks".
      */
     public function adjust(Request $request, int $id)
     {
         $retailer = Retailer::with('wallet')->findOrFail($id);
 
         $data = $request->validate([
-            'type'        => 'required|in:credit,debit',
-            'amount'      => 'required|numeric|decimal:0,2|min:1|max:100000',
-            'reason'      => 'required|string|min:5|max:200',
-            'request_key' => 'required|uuid',
+            'type'          => 'required|in:credit,debit',
+            'amount'        => 'required|numeric|decimal:0,2|min:1|max:100000',
+            'payment_mode'  => ['required', Rule::in(self::PAYMENT_MODES)],
+            'txn_reference' => ['required', 'string', 'min:6', 'max:40', 'regex:/^[A-Za-z0-9\-_\/]+$/'],
+            'remarks'       => 'nullable|string|max:200',
+            'reason'        => 'nullable|string|max:200',
+            'request_key'   => 'required|uuid',
         ], [
-            'reason.min' => 'Please write a clear reason (at least 5 characters). It is saved in the audit log.',
+            'txn_reference.regex' => 'Use only letters, numbers, - _ and / in the reference.',
+            'txn_reference.min'   => 'The transaction reference must be at least 6 characters.',
         ]);
 
         abort_if(! $retailer->wallet, 422, 'This retailer has no wallet.');
 
         $reference = WalletService::adjustmentReference($retailer->id, $data['request_key']);
+        $txnRef    = strtoupper(trim($data['txn_reference']));
+        $remarks   = trim((string) ($data['remarks'] ?? $data['reason'] ?? ''));
 
         // Double click / retry with the same key: answer again, but do not change the wallet or write a second audit row
         $already = WalletLedger::where('reference', $reference)->exists();
 
-        $reason      = trim($data['reason']);
-        $description = ($data['type'] === 'credit' ? 'Admin credit: ' : 'Admin deduction: ') . $reason;
+        // The same bank reference (UTR) can be used for one entry only
+        if (! $already && WalletLedger::where('txn_reference', $txnRef)->exists()) {
+            throw ValidationException::withMessages(['txn_reference' => 'This transaction reference is already used for another entry.']);
+        }
+
+        $description = ($data['type'] === 'credit' ? 'Admin credit' : 'Admin deduction')
+            . " ({$data['payment_mode']}, ref {$txnRef})"
+            . ($remarks !== '' ? ": {$remarks}" : '');
 
         try {
-            $entry = $data['type'] === 'credit'
-                ? $this->wallets->credit($retailer->id, $data['amount'], $reference, $description)
-                : $this->wallets->reversal($retailer->id, $data['amount'], $reference, $description);
+            $entry = DB::transaction(function () use ($data, $retailer, $reference, $description, $txnRef, $already) {
+                $entry = $data['type'] === 'credit'
+                    ? $this->wallets->credit($retailer->id, $data['amount'], $reference, $description)
+                    : $this->wallets->reversal($retailer->id, $data['amount'], $reference, $description);
+
+                // Saved in the same transaction as the wallet change, so one can never exist without the other
+                if (! $already) {
+                    $entry->update(['payment_mode' => $data['payment_mode'], 'txn_reference' => $txnRef]);
+                }
+
+                return $entry;
+            });
         } catch (InsufficientBalanceException $e) {
             return response()->json(['message' => $e->getMessage()], 422);
         }
@@ -105,7 +136,9 @@ class AdminWalletController extends Controller
                 'retailer_id'   => $retailer->id,
                 'type'          => $data['type'],
                 'amount'        => (float) $data['amount'],
-                'reason'        => $reason,
+                'payment_mode'  => $data['payment_mode'],
+                'txn_reference' => $txnRef,
+                'remarks'       => $remarks,
                 'balance_after' => (float) $entry->balance_after,
             ]);
         }
@@ -131,6 +164,8 @@ class AdminWalletController extends Controller
                     $l->created_at?->format('Y-m-d H:i:s'),
                     $l->type,
                     $l->description ?? '',
+                    $l->payment_mode ?? '',
+                    $l->txn_reference ?? '',
                     number_format((float) $l->amount, 2, '.', ''),
                     number_format((float) $l->balance_after, 2, '.', ''),
                     $l->reference,
@@ -142,7 +177,7 @@ class AdminWalletController extends Controller
 
         return Csv::download(
             'wallet-statement-retailer-' . $retailer->id . '-' . now()->format('Ymd') . '.csv',
-            ['Date', 'Type', 'Description', 'Amount', 'Balance after', 'Transaction ID'],
+            ['Date', 'Type', 'Description', 'Payment mode', 'Bank reference', 'Amount', 'Balance after', 'Transaction ID'],
             $rows
         );
     }

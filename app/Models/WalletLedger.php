@@ -10,7 +10,7 @@ class WalletLedger extends Model
     // The table only has created_at (no updated_at), ledger rows are never edited
     public $timestamps = false;
 
-    protected $fillable = ['wallet_id', 'reference', 'type', 'amount', 'balance_after', 'description'];
+    protected $fillable = ['wallet_id', 'reference', 'type', 'amount', 'balance_after', 'description', 'payment_mode', 'txn_reference'];
 
     protected function casts(): array
     {
