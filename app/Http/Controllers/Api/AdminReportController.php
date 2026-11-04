@@ -9,6 +9,7 @@ use App\Models\Retailer;
 use App\Models\RetailerPricing;
 use App\Models\Verification;
 use App\Models\VerificationService;
+use App\Models\WalletLedger;
 use App\Support\Csv;
 use Carbon\Carbon;
 use Generator;
@@ -242,6 +243,21 @@ class AdminReportController extends Controller
             ->selectRaw('DATE(created_at) AS d, SUM(' . sprintf($kc, 'price') . ') AS revenue, SUM(' . sprintf($kc, 'provider_cost') . ') AS cost')
             ->groupBy('d')->get()->keyBy('d');
 
+        // ---- Counts per day and outcome: single checks and Complete KYC cases together ----
+        // verified = success / completed, pending = pending / in_progress, failed = everything else that ended
+        $outcome = ['success' => 'verified', 'completed' => 'verified', 'pending' => 'pending', 'in_progress' => 'pending'];
+
+        $perDay = [];
+        foreach ([Verification::class, KycCase::class] as $model) {
+            $model::whereBetween('created_at', [$from, $to])
+                ->selectRaw('DATE(created_at) AS d, status, COUNT(*) AS c')
+                ->groupBy('d', 'status')->get()
+                ->each(function ($row) use (&$perDay, $outcome) {
+                    $bucket = $outcome[$row->status] ?? 'failed';
+                    $perDay[$row->d][$bucket] = ($perDay[$row->d][$bucket] ?? 0) + (int) $row->c;
+                });
+        }
+
         // ---- By service (single checks and the KYC bundle share the same table of services) ----
         $names = VerificationService::pluck('name', 'id');
 
@@ -300,16 +316,26 @@ class AdminReportController extends Controller
             $revenue = (float) ($vDaily[$key]->revenue ?? 0) + (float) ($kDaily[$key]->revenue ?? 0);
             $cost    = (float) ($vDaily[$key]->cost ?? 0) + (float) ($kDaily[$key]->cost ?? 0);
 
-            $daily[] = ['date' => $key, 'revenue' => round($revenue, 2), 'cost' => round($cost, 2), 'profit' => round($revenue - $cost, 2)];
+            $verified = (int) ($perDay[$key]['verified'] ?? 0);
+            $failed   = (int) ($perDay[$key]['failed'] ?? 0);
+            $pending  = (int) ($perDay[$key]['pending'] ?? 0);
+
+            $daily[] = [
+                'date' => $key, 'revenue' => round($revenue, 2), 'cost' => round($cost, 2), 'profit' => round($revenue - $cost, 2),
+                'total' => $verified + $failed + $pending, 'verified' => $verified, 'failed' => $failed, 'pending' => $pending,
+            ];
         }
 
         // ---- Monthly series (the daily numbers added up per month) ----
         $months = [];
         foreach ($daily as $d) {
             $m = substr($d['date'], 0, 7);
-            $months[$m] ??= ['month' => $m, 'revenue' => 0.0, 'cost' => 0.0];
-            $months[$m]['revenue'] += $d['revenue'];
-            $months[$m]['cost']    += $d['cost'];
+            $months[$m] ??= ['month' => $m, 'revenue' => 0.0, 'cost' => 0.0, 'verified' => 0, 'failed' => 0, 'pending' => 0];
+            $months[$m]['revenue']  += $d['revenue'];
+            $months[$m]['cost']     += $d['cost'];
+            $months[$m]['verified'] += $d['verified'];
+            $months[$m]['failed']   += $d['failed'];
+            $months[$m]['pending']  += $d['pending'];
         }
 
         $monthly = collect($months)->map(fn ($m) => [
@@ -318,12 +344,50 @@ class AdminReportController extends Controller
             'cost'           => round($m['cost'], 2),
             'profit'         => round($m['revenue'] - $m['cost'], 2),
             'margin_percent' => $this->marginPercent($m['revenue'], $m['cost']),
+            'total'          => $m['verified'] + $m['failed'] + $m['pending'],
+            'verified'       => $m['verified'],
+            'failed'         => $m['failed'],
+            'pending'        => $m['pending'],
         ])->values();
 
         // ---- Failed / still running counts, and money on hold right now (open reconciliations) ----
         $vStatus = Verification::whereBetween('created_at', [$from, $to])->selectRaw('status, COUNT(*) AS c')->groupBy('status')->pluck('c', 'status');
         $kStatus = KycCase::whereBetween('created_at', [$from, $to])->selectRaw('status, COUNT(*) AS c')->groupBy('status')->pluck('c', 'status');
         $hold    = Reconciliation::where('status', 'open')->selectRaw('COUNT(*) AS c, COALESCE(SUM(amount), 0) AS a')->first();
+
+        // ---- Wallet movements per day (money added, money charged for checks, admin deductions) ----
+        $walletMap = [];
+        WalletLedger::whereBetween('created_at', [$from, $to])
+            ->whereIn('type', ['credit', 'debit', 'reversal'])
+            ->selectRaw('DATE(created_at) AS d, type, COUNT(*) AS c, SUM(amount) AS a')
+            ->groupBy('d', 'type')->get()
+            ->each(function ($row) use (&$walletMap) {
+                $walletMap[$row->d][$row->type] = ['c' => (int) $row->c, 'a' => (float) $row->a];
+            });
+
+        $walletDaily = [];
+        $walletTotals = ['credited' => 0.0, 'charged' => 0.0, 'deducted' => 0.0, 'transactions' => 0];
+
+        for ($day = $from->copy(); $day->lte($to); $day->addDay()) {
+            $key = $day->toDateString();
+            $r   = $walletMap[$key] ?? [];
+
+            $row = [
+                'date'         => $key,
+                'credited'     => round($r['credit']['a'] ?? 0, 2),
+                'charged'      => round($r['debit']['a'] ?? 0, 2),
+                'deducted'     => round($r['reversal']['a'] ?? 0, 2),
+                'transactions' => (int) (($r['credit']['c'] ?? 0) + ($r['debit']['c'] ?? 0) + ($r['reversal']['c'] ?? 0)),
+            ];
+
+            foreach (['credited', 'charged', 'deducted', 'transactions'] as $k) {
+                $walletTotals[$k] += $row[$k];
+            }
+
+            $walletDaily[] = $row;
+        }
+
+        $walletTotals = array_map(fn ($v) => is_float($v) ? round($v, 2) : $v, $walletTotals);
 
         // ---- Totals ----
         $revenue = round($byService->sum('revenue'), 2);
@@ -352,6 +416,7 @@ class AdminReportController extends Controller
             'by_retailer' => $byRetailer,
             'daily'       => $daily,
             'monthly'     => $monthly,
+            'wallet'      => ['totals' => $walletTotals, 'daily' => $walletDaily],
         ];
     }
 
